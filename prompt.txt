@@ -1,0 +1,126 @@
+
+Create a Python script to backfill missed stockist email attachments using a local folder of exported Outlook emails (.msg and/or .eml). Use EMAIL RECEIVED TIME for filenames and logging. Use Excel master data (in a OneDrive-synced SharePoint folder) to map old sender email IDs to stockist codes, save renamed attachments into the synced SharePoint folder, and append records into an existing Excel log file (also in the synced folder).
+
+ENVIRONMENT / PATHS (Windows)
+- SharePoint is synced with OneDrive at this local path:
+  C:\Users\PAWARUX1\Abbott\IN-EPD-SmartStockDB - Documents
+
+- Master Excel file (in the synced folder):
+  Customer Division Master_Data.xlsx
+
+- Log Excel file (in the synced folder):
+  Stockist_Log.xlsx
+
+- Local email export folder contains .msg and/or .eml files:
+  (script should accept a configurable path like LOCAL_EMAIL_FOLDER)
+
+IMPORTANT CONSTRAINTS
+- All old emails are in Inbox exports only (no need to handle Outlook folders inside mailbox).
+- The script reads email files from disk (.msg/.eml), NOT from Outlook API.
+- Use EMAIL RECEIVED TIME (not script runtime) for:
+  (1) the renamed filename date parts
+  (2) the Excel log Timestamp field
+
+MASTER DATA (Customer Division Master_Data.xlsx)
+- Master contains columns:
+  - CustomerNo  (stockist code)
+  - EmailID     (current email; not used for backfill match)
+  - Old_Emailids  (old sender email used earlier)
+- Only process rows where Old_Emailids is valid:
+  - not empty AND not null AND not '0' (string/number)
+- Matching rule:
+  - If an email's sender address equals Old_Emailids (case-insensitive, trimmed), then that email belongs to that stockist.
+  - Use CustomerNo from that row as the stockist code for file naming.
+
+OUTPUT FILE NAMING
+For each attachment, rename as:
+  <CustomerNo>_<ReceivedDate>_<ReceivedDate>_<OriginalFileName>
+
+Where:
+- <CustomerNo> = stockist code from master (CustomerNo)
+- <ReceivedDate> = email RECEIVED date formatted as yyyyMMdd (recommended; configurable)
+- date appears TWICE exactly (as shown)
+- <OriginalFileName> must be sanitized for Windows/SharePoint:
+  Replace invalid chars with '-' :
+  / \ : * ? " < > | 
+- Do NOT overwrite existing files:
+  If a file with the same final name already exists in destination folder, skip saving.
+
+DESTINATION (OneDrive-synced SharePoint folder)
+- Save attachments into a configurable destination folder under the synced root.
+- Provide an option:
+  A) Save all files into one folder, e.g.:
+     <SYNC_ROOT>\Stockist Attachments
+  B) Save into stockist-wise folders:
+     <SYNC_ROOT>\Stockist Attachments\<CustomerNo>\
+  If folders do not exist, create them.
+
+LOG FILE (Stockist_Log.xlsx)
+- Existing log table contains at least columns:
+  - CustomerNo
+  - EmailID
+  - Timestamp
+  - Status
+- Append one row per attachment processed:
+  - CustomerNo = CustomerNo from master
+  - EmailID = actual sender email extracted from the message file (preferred)
+  - Timestamp = email received datetime (not now)
+  - Status:
+      "Pass" for successfully saved attachment
+      "Skipped-FileExists" if destination file already exists
+      "Fail" if any error occurred
+- If the log file/table is locked or open, retries should be attempted and failures should be reported clearly.
+
+PROCESSING LOGIC
+1) Load master Excel into memory and build lookup:
+   old_email_lower -> CustomerNo
+2) Walk the LOCAL_EMAIL_FOLDER and process all .msg and .eml files.
+3) For each email file:
+   a) Parse sender email (From)
+   b) Parse RECEIVED datetime (not Sent time)
+   c) Extract attachments (name + bytes)
+   d) If no attachments, skip
+   e) If sender not found in master Old_Emailids lookup, skip and count as unmatched
+   f) For each attachment:
+      - Sanitize original name
+      - Build FinalFileName = CustomerNo_yyyyMMdd_yyyyMMdd_OriginalName
+      - Determine destination full path
+      - If file exists: log Skipped-FileExists
+      - Else save file to destination folder and log Pass
+      - On exception: log Fail and continue processing next attachment/email
+
+DATE RANGE FILTER (optional but recommended)
+- Provide a config DAYS_BACK (e.g., 90)
+- Only process emails with received datetime >= (today - DAYS_BACK)
+
+SUMMARY OUTPUT
+At the end print a summary:
+- total email files scanned
+- total emails with attachments
+- total attachments saved (Pass)
+- total attachments skipped (Skipped-FileExists)
+- total failures (Fail)
+- total unmatched emails (sender not found in master Old_Emailids)
+
+TECHNICAL REQUIREMENTS
+- Use Python on Windows.
+- Parse .msg: use extract_msg (or equivalent reliable library).
+- Parse .eml: use Python email library.
+- Read/write Excel (.xlsx): use openpyxl (preferred for append) or pandas+openpyxl.
+- Ensure Excel file writing appends rows without corrupting workbook.
+- Include retry/backoff when appending to Stockist_Log.xlsx in case OneDrive sync temporarily locks the file.
+- Include a configuration section at top of script with:
+  SYNC_ROOT = r"C:\Users\PAWARUX1\Abbott\IN-EPD-SmartStockDB - Documents"
+  MASTER_XLSX = path to master file
+  LOG_XLSX = path to log file
+  LOCAL_EMAIL_FOLDER = path to exported emails
+  DESTINATION_FOLDER = base folder under SYNC_ROOT
+  USE_STOCKIST_SUBFOLDER = True/False
+  DAYS_BACK = integer
+
+DELDELIVERABLE
+- Provide a complete Python script with:
+  - clear configuration section
+  - required pip install commands
+  - robust error handling + clear console logs
+  - correct filename format and date usage
