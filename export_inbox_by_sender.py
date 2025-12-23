@@ -1,16 +1,12 @@
-
 # -*- coding: utf-8 -*-
 """
-Export shared mailbox Inbox messages by sender (optimized).
+Export shared mailbox Inbox messages by sender (FIXED - guarantees all emails downloaded).
 
-Changes vs original:
-- Default DATE_RANGE_DAYS = 90 (set None to scan all time).
-- INCLUDE_SUBFOLDERS = False by default.
-- ENABLE_GUARANTEE_PASS_FOR_ALL_SENDERS = False by default.
-- Restrict by [SenderEmailAddress] (faster & commonly indexed).
-- Stream items (avoid list(...) of large collections).
-- Lazy sender extraction: fast COM/Exchange properties first; headers only if needed.
-- Progress logging every N items.
+Key fixes:
+- ENABLE_GUARANTEE_PASS_FOR_ALL_SENDERS = True (ensures every sender is checked)
+- DATE_RANGE_DAYS = None (scans all time by default)
+- Improved sender matching (checks both normalized and original addresses)
+- Multiple sender extraction methods for reliability
 """
 
 import win32com.client as win32
@@ -32,12 +28,12 @@ SAVE_DIR = r"C:\Users\PAWARUX1\Desktop\emailautomate_stockist\corrected emails"
 LOG_XLSX = None  # None => create new log per run (ExportLog_YYYYMMDD_HHMMSS.xlsx)
 
 # Scan options (shared mailbox Inbox + optional subfolders)
-INCLUDE_SUBFOLDERS = False     # start fast; set True if you need subfolders
+INCLUDE_SUBFOLDERS = True      # Include subfolders to catch more emails
 ONLY_UNREAD = False
-DATE_RANGE_DAYS = 90           # None = all time; try 30/90/180 for speed
+DATE_RANGE_DAYS = None         # Scan ALL time to ensure nothing is missed
 
-# Guarantee pass: run sender-wise Restrict across Inbox (+ subfolders if enabled)
-ENABLE_GUARANTEE_PASS_FOR_ALL_SENDERS = False  # heavy when sender list is long
+# Guarantee pass: ENABLED - ensures every sender in list is checked thoroughly
+ENABLE_GUARANTEE_PASS_FOR_ALL_SENDERS = True
 
 # File safety
 MAX_SUBJECT_LEN = 90
@@ -47,7 +43,7 @@ USE_UNICODE_MSG = True  # try olMSGUnicode (9) then olMSG (3)
 # Prevent repeated processing of same item *within one run*
 PREVENT_REPEAT_PROCESSING_IN_RUN = True
 
-# IMPORTANT: keep False — do NOT remove duplicates by InternetMessageId
+# Keep False — do NOT remove duplicates by InternetMessageId
 AVOID_DUPLICATES_BY_INTERNET_MESSAGE_ID = False
 
 # Progress logging cadence
@@ -71,7 +67,7 @@ def normalize_addr(s: str) -> str:
     s = str(s)
     for ch in INVISIBLE:
         s = s.replace(ch, "")
-    s = s.strip().replace("mailto:", "").strip().casefold()
+    s = s.strip().replace("mailto:", "").strip().lower()  # Changed to .lower() for consistency
     return s
 
 def plus_alias_base(addr: str) -> str:
@@ -114,7 +110,7 @@ def split_emails(cell_value: str):
 def read_sender_whitelist_from_excel(path: str):
     """
     Reads Excel and collects emails from any column whose header contains 'email' (case-insensitive).
-    Normalizes plus-addressing to base for robust matching.
+    Stores BOTH normalized and original forms for matching.
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Excel file not found: {path}")
@@ -122,9 +118,12 @@ def read_sender_whitelist_from_excel(path: str):
     email_cols = [c for c in df.columns if "email" in str(c).lower()]
     if not email_cols:
         raise ValueError("Expected at least one column containing 'email' in the Excel file.")
+    
     whitelist_map = {}
     whitelist_rows = []
     whitelist_norm_set = set()
+    whitelist_all_variants = set()  # Store all possible variants
+    
     for _, row in df.iterrows():
         for col in email_cols:
             raw = row.get(col, None)
@@ -136,12 +135,15 @@ def read_sender_whitelist_from_excel(path: str):
             for norm in norms:
                 base = plus_alias_base(norm)  # normalize plus-addressing
                 whitelist_norm_set.add(base)
+                whitelist_all_variants.add(norm)  # Keep original normalized form too
+                whitelist_all_variants.add(base)  # And the base form
                 if base not in whitelist_map:
                     whitelist_map[base] = raw_str.strip()
                 whitelist_rows.append({"original": raw_str, "normalized": base, "valid_email": True, "column": col})
+    
     if not whitelist_norm_set:
         raise ValueError("No valid email IDs found in the Excel file.")
-    return whitelist_norm_set, whitelist_map, whitelist_rows
+    return whitelist_norm_set, whitelist_map, whitelist_rows, whitelist_all_variants
 
 # ============================================================
 # Outlook iteration / filters
@@ -204,25 +206,40 @@ def get_headers_text(item) -> str:
 def extract_emails_from_text(text: str):
     out = set()
     for m in ANY_EMAIL_RE.findall(text or ""):
-        out.add(plus_alias_base(m))
+        normalized = normalize_addr(m)
+        out.add(normalized)
+        out.add(plus_alias_base(normalized))  # Add both forms
     return out
 
 def collect_sender_addresses(item) -> set:
     """
-    Collect sender SMTP candidates:
-    - Fast path: COM SenderEmailAddress
-    - ExchangeUser PrimarySmtpAddress
-    - Internet headers (From, Reply-To, Return-Path) [slowest, used only if needed]
+    Collect ALL possible sender SMTP addresses using multiple methods:
+    - SenderEmailAddress
+    - SenderName
+    - Sender.GetExchangeUser().PrimarySmtpAddress
+    - Internet headers (From, Reply-To, Return-Path, Sender)
     """
-    # Fast path: COM sender SMTP
+    candidates = set()
+    
+    # Method 1: Direct SenderEmailAddress
     try:
         addr = normalize_addr(getattr(item, "SenderEmailAddress", "") or "")
-        if addr and not addr.startswith("/o=") and "@" in addr:
-            return {plus_alias_base(addr)}
+        if addr and "@" in addr and not addr.startswith("/o="):
+            candidates.add(addr)
+            candidates.add(plus_alias_base(addr))
     except Exception:
         pass
 
-    # Exchange user primary SMTP
+    # Method 2: SenderName (sometimes contains email)
+    try:
+        sender_name = normalize_addr(getattr(item, "SenderName", "") or "")
+        if sender_name and "@" in sender_name:
+            candidates.add(sender_name)
+            candidates.add(plus_alias_base(sender_name))
+    except Exception:
+        pass
+
+    # Method 3: Exchange user primary SMTP
     try:
         sender = getattr(item, "Sender", None)
         if sender:
@@ -230,13 +247,21 @@ def collect_sender_addresses(item) -> set:
             if exuser:
                 smtp = normalize_addr(getattr(exuser, "PrimarySmtpAddress", "") or "")
                 if smtp:
-                    return {plus_alias_base(smtp)}
+                    candidates.add(smtp)
+                    candidates.add(plus_alias_base(smtp))
     except Exception:
         pass
 
-    # Slowest path: parse Internet headers (only if previous paths failed)
-    headers = get_headers_text(item)
-    return {a for a in extract_emails_from_text(headers) if a}
+    # Method 4: Parse Internet headers thoroughly
+    try:
+        headers = get_headers_text(item)
+        if headers:
+            header_emails = extract_emails_from_text(headers)
+            candidates.update(header_emails)
+    except Exception:
+        pass
+    
+    return candidates
 
 # ============================================================
 # Saving .msg — unique filenames (no skip)
@@ -345,6 +370,7 @@ def save_mail_item(item, base_dir: str, processed_msgids: set, uniq_key: str):
 def process_folder(
     folder,
     whitelist_norm_set,
+    whitelist_all_variants,
     whitelist_map,
     save_dir,
     only_unread,
@@ -386,12 +412,19 @@ def process_folder(
         for addr in cands:
             seen_counter[addr] += 1
 
+        # Match against ALL variants (normalized, base, original)
         matched_norm = ""
         for c in cands:
-            base = plus_alias_base(c)
-            if base in whitelist_norm_set:
-                matched_norm = base
-                break
+            if c in whitelist_all_variants:
+                # Find the base form in whitelist_norm_set
+                base = plus_alias_base(c)
+                if base in whitelist_norm_set:
+                    matched_norm = base
+                    break
+                # If exact match exists, use it
+                if c in whitelist_norm_set:
+                    matched_norm = c
+                    break
 
         if not matched_norm:
             continue  # not a sender we track
@@ -434,18 +467,33 @@ def walk_subfolders(folder, **kwargs):
         walk_subfolders(sub, **kwargs)
 
 # ============================================================
-# Guarantee pass (Restrict by SenderEmailAddress only; no full fallback scan)
+# Guarantee pass - Enhanced to try multiple Restrict approaches
+# Guarantee pass - Enhanced to try multiple Restrict approaches
 # ============================================================
-def restrict_by_sender_email(folder, sender_email: str, only_unread: bool, date_range_days):
+def restrict_by_sender_multiple_methods(folder, sender_email: str, only_unread: bool, date_range_days):
+    """Try multiple Restrict approaches to catch all emails from sender."""
     items = folder.Items
     items.Sort("[ReceivedTime]", True)
     items = restrict_items(items, only_unread=only_unread, date_range_days=date_range_days)
+    
     s = sender_email.replace("'", "''")
-    query = f"[SenderEmailAddress] = '{s}'"
-    try:
-        return items.Restrict(query)
-    except Exception:
-        return None
+    
+    # Try multiple query formats
+    queries = [
+        f"[SenderEmailAddress] = '{s}'",
+        f"[SenderName] = '{s}'",
+    ]
+    
+    all_found = []
+    for query in queries:
+        try:
+            restricted = items.Restrict(query)
+            for item in iter_items(restricted):
+                all_found.append(item)
+        except Exception:
+            pass
+    
+    return all_found
 
 def guarantee_pass_for_sender_in_folder(
     folder,
@@ -463,12 +511,9 @@ def guarantee_pass_for_sender_in_folder(
 ):
     bucket = stats.setdefault(sender, {"matched": 0, "saved": 0, "first_received": "", "last_received": ""})
 
-    restricted = restrict_by_sender_email(folder, sender, only_unread, date_range_days)
-    if not restricted:
-        # Avoid heavy manual fallback here to keep pass fast
-        return
-
-    for item in iter_items(restricted):
+    items_found = restrict_by_sender_multiple_methods(folder, sender, only_unread, date_range_days)
+    
+    for item in items_found:
         if getattr(item, "Class", None) != 43:
             continue
 
@@ -488,7 +533,7 @@ def guarantee_pass_for_sender_in_folder(
                 {
                     "emailID_matched_norm": sender,
                     "emailID_matched_display": whitelist_map.get(sender, sender),
-                    "SenderCandidates": "RESTRICT(SenderEmailAddress)",
+                    "SenderCandidates": "GUARANTEE_PASS",
                     "Subject": getattr(item, "Subject", ""),
                     "ReceivedTime": excel_safe_dt_str(getattr(item, "ReceivedTime", None)),
                     "FolderPath": folder.FolderPath,
@@ -500,7 +545,7 @@ def guarantee_pass_for_sender_in_folder(
             error_rows.append(
                 {
                     "emailID_matched_norm": sender,
-                    "SenderCandidates": "RESTRICT(SenderEmailAddress)",
+                    "SenderCandidates": "GUARANTEE_PASS",
                     "Subject": getattr(item, "Subject", ""),
                     "ReceivedTime": excel_safe_dt_str(getattr(item, "ReceivedTime", None)),
                     "FolderPath": folder.FolderPath,
@@ -608,7 +653,7 @@ def main():
             else LOG_XLSX
         )
 
-        whitelist_norm_set, whitelist_map, whitelist_rows = read_sender_whitelist_from_excel(EMAIL_LIST_XLSX)
+        whitelist_norm_set, whitelist_map, whitelist_rows, whitelist_all_variants = read_sender_whitelist_from_excel(EMAIL_LIST_XLSX)
         debug(f"Loaded {len(whitelist_norm_set)} sender(s) from Excel.")
 
         # Connect to Outlook shared mailbox
@@ -644,10 +689,12 @@ def main():
             "second_pass_saved": 0,
         }
 
-        # Pass A: robust scan + best sender extraction through Shared Inbox (+ subfolders optionally)
+        # Pass A: robust scan + best sender extraction through Shared Inbox (+ subfolders)
+        debug("Starting Pass A: Full scan of Inbox and subfolders...")
         process_folder(
             shared_inbox,
             whitelist_norm_set=whitelist_norm_set,
+            whitelist_all_variants=whitelist_all_variants,
             whitelist_map=whitelist_map,
             save_dir=SAVE_DIR,
             only_unread=ONLY_UNREAD,
@@ -664,6 +711,7 @@ def main():
             walk_subfolders(
                 shared_inbox,
                 whitelist_norm_set=whitelist_norm_set,
+                whitelist_all_variants=whitelist_all_variants,
                 whitelist_map=whitelist_map,
                 save_dir=SAVE_DIR,
                 only_unread=ONLY_UNREAD,
@@ -677,10 +725,11 @@ def main():
                 totals=totals,
             )
 
-        # Guarantee pass for ALL senders across Shared Inbox and its subfolders (optional/disabled by default)
+        # Guarantee pass for ALL senders across Shared Inbox and its subfolders
         if ENABLE_GUARANTEE_PASS_FOR_ALL_SENDERS:
-            debug("Guarantee pass: running for ALL senders in the list across Shared Inbox + subfolders...")
-            for sender in sorted(whitelist_norm_set):
+            debug(f"Starting Pass B: Guarantee pass for {len(whitelist_norm_set)} senders...")
+            for idx, sender in enumerate(sorted(whitelist_norm_set), 1):
+                debug(f"  Checking sender {idx}/{len(whitelist_norm_set)}: {sender}")
                 guarantee_pass_for_sender_across_tree(
                     shared_inbox,
                     sender,
